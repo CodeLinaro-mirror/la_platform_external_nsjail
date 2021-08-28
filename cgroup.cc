@@ -38,12 +38,11 @@
 namespace cgroup {
 
 static bool createCgroup(const std::string& cgroup_path, pid_t pid) {
-	LOG_D("Create '%s' for PID=%d", cgroup_path.c_str(), (int)pid);
+	LOG_D("Create '%s' for pid=%d", cgroup_path.c_str(), (int)pid);
 	if (mkdir(cgroup_path.c_str(), 0700) == -1 && errno != EEXIST) {
 		PLOG_W("mkdir('%s', 0700) failed", cgroup_path.c_str());
 		return false;
 	}
-
 	return true;
 }
 
@@ -55,14 +54,13 @@ static bool writeToCgroup(
 		LOG_W("Could not update %s", what.c_str());
 		return false;
 	}
-
 	return true;
 }
 
 static bool addPidToTaskList(const std::string& cgroup_path, pid_t pid) {
 	std::string pid_str = std::to_string(pid);
 	std::string tasks_path = cgroup_path + "/tasks";
-	LOG_D("Adding PID='%s' to '%s'", pid_str.c_str(), tasks_path.c_str());
+	LOG_D("Adding pid='%s' to '%s'", pid_str.c_str(), tasks_path.c_str());
 	return writeToCgroup(tasks_path, pid_str, "'" + tasks_path + "' task list");
 }
 
@@ -136,12 +134,12 @@ static bool initNsFromParentCpu(nsjconf_t* nsjconf, pid_t pid) {
 				      "/NSJAIL." + std::to_string(pid);
 	RETURN_ON_FAILURE(createCgroup(cpu_cgroup_path, pid));
 
+	RETURN_ON_FAILURE(
+	    writeToCgroup(cpu_cgroup_path + "/cpu.cfs_period_us", "1000000", "cpu period"));
+
 	std::string cpu_ms_per_sec_str = std::to_string(nsjconf->cgroup_cpu_ms_per_sec * 1000U);
 	RETURN_ON_FAILURE(
 	    writeToCgroup(cpu_cgroup_path + "/cpu.cfs_quota_us", cpu_ms_per_sec_str, "cpu quota"));
-
-	RETURN_ON_FAILURE(
-	    writeToCgroup(cpu_cgroup_path + "/cpu.cfs_period_us", "1000000", "cpu period"));
 
 	return addPidToTaskList(cpu_cgroup_path, pid);
 }

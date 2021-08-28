@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "cgroup.h"
+#include "cgroup2.h"
 #include "contain.h"
 #include "logs.h"
 #include "macros.h"
@@ -58,6 +59,9 @@ namespace subproc {
 #if !defined(CLONE_NEWCGROUP)
 #define CLONE_NEWCGROUP 0x02000000
 #endif /* !defined(CLONE_NEWCGROUP) */
+#if !defined(CLONE_NEWTIME)
+#define CLONE_NEWTIME 0x00000080
+#endif /* !defined(CLONE_NEWTIME) */
 
 static const std::string cloneFlagsToStr(uintptr_t flags) {
 	std::string res;
@@ -66,43 +70,50 @@ static const std::string cloneFlagsToStr(uintptr_t flags) {
 		const uintptr_t flag;
 		const char* const name;
 	} static const cloneFlags[] = {
-	    NS_VALSTR_STRUCT(CLONE_VM),
-	    NS_VALSTR_STRUCT(CLONE_FS),
-	    NS_VALSTR_STRUCT(CLONE_FILES),
-	    NS_VALSTR_STRUCT(CLONE_SIGHAND),
-	    NS_VALSTR_STRUCT(CLONE_PTRACE),
-	    NS_VALSTR_STRUCT(CLONE_VFORK),
-	    NS_VALSTR_STRUCT(CLONE_PARENT),
-	    NS_VALSTR_STRUCT(CLONE_THREAD),
-	    NS_VALSTR_STRUCT(CLONE_NEWNS),
-	    NS_VALSTR_STRUCT(CLONE_SYSVSEM),
-	    NS_VALSTR_STRUCT(CLONE_SETTLS),
-	    NS_VALSTR_STRUCT(CLONE_PARENT_SETTID),
-	    NS_VALSTR_STRUCT(CLONE_CHILD_CLEARTID),
-	    NS_VALSTR_STRUCT(CLONE_DETACHED),
-	    NS_VALSTR_STRUCT(CLONE_UNTRACED),
-	    NS_VALSTR_STRUCT(CLONE_CHILD_SETTID),
-	    NS_VALSTR_STRUCT(CLONE_NEWCGROUP),
-	    NS_VALSTR_STRUCT(CLONE_NEWUTS),
-	    NS_VALSTR_STRUCT(CLONE_NEWIPC),
-	    NS_VALSTR_STRUCT(CLONE_NEWUSER),
-	    NS_VALSTR_STRUCT(CLONE_NEWPID),
-	    NS_VALSTR_STRUCT(CLONE_NEWNET),
-	    NS_VALSTR_STRUCT(CLONE_IO),
+		NS_VALSTR_STRUCT(CLONE_NEWTIME),
+		NS_VALSTR_STRUCT(CLONE_VM),
+		NS_VALSTR_STRUCT(CLONE_FS),
+		NS_VALSTR_STRUCT(CLONE_FILES),
+		NS_VALSTR_STRUCT(CLONE_SIGHAND),
+#if !defined(CLONE_PIDFD)
+#define CLONE_PIDFD 0x00001000
+#endif
+		NS_VALSTR_STRUCT(CLONE_PIDFD),
+		NS_VALSTR_STRUCT(CLONE_PTRACE),
+		NS_VALSTR_STRUCT(CLONE_VFORK),
+		NS_VALSTR_STRUCT(CLONE_PARENT),
+		NS_VALSTR_STRUCT(CLONE_THREAD),
+		NS_VALSTR_STRUCT(CLONE_NEWNS),
+		NS_VALSTR_STRUCT(CLONE_SYSVSEM),
+		NS_VALSTR_STRUCT(CLONE_SETTLS),
+		NS_VALSTR_STRUCT(CLONE_PARENT_SETTID),
+		NS_VALSTR_STRUCT(CLONE_CHILD_CLEARTID),
+		NS_VALSTR_STRUCT(CLONE_DETACHED),
+		NS_VALSTR_STRUCT(CLONE_UNTRACED),
+		NS_VALSTR_STRUCT(CLONE_CHILD_SETTID),
+		NS_VALSTR_STRUCT(CLONE_NEWCGROUP),
+		NS_VALSTR_STRUCT(CLONE_NEWUTS),
+		NS_VALSTR_STRUCT(CLONE_NEWIPC),
+		NS_VALSTR_STRUCT(CLONE_NEWUSER),
+		NS_VALSTR_STRUCT(CLONE_NEWPID),
+		NS_VALSTR_STRUCT(CLONE_NEWNET),
+		NS_VALSTR_STRUCT(CLONE_IO),
 	};
 
-	uintptr_t knownFlagMask = CSIGNAL;
+	uintptr_t knownFlagMask = 0;
 	for (const auto& i : cloneFlags) {
 		if (flags & i.flag) {
-			res.append(i.name).append("|");
+			if (!res.empty()) {
+				res.append("|");
+			}
+			res.append(i.name);
 		}
 		knownFlagMask |= i.flag;
 	}
 
 	if (flags & ~(knownFlagMask)) {
-		util::StrAppend(&res, "%#tx|", flags & ~(knownFlagMask));
+		util::StrAppend(&res, "|%#tx", flags & ~(knownFlagMask));
 	}
-	res.append(util::sigName(flags & CSIGNAL).c_str());
 	return res;
 }
 
@@ -128,7 +139,8 @@ static bool resetEnv(void) {
 static const char kSubprocDoneChar = 'D';
 static const char kSubprocErrorChar = 'E';
 
-static void subprocNewProc(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err, int pipefd) {
+static void subprocNewProc(
+    nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err, int pipefd) {
 	if (!contain::setupFD(nsjconf, fd_in, fd_out, fd_err)) {
 		return;
 	}
@@ -141,7 +153,12 @@ static void subprocNewProc(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err
 			LOG_E("Couldn't initialize net user namespace");
 			return;
 		}
-		if (!cgroup::initNsFromParent(nsjconf, getpid())) {
+		if (nsjconf->use_cgroupv2) {
+			if (!cgroup2::initNsFromParent(nsjconf, getpid())) {
+				LOG_E("Couldn't initialize net user namespace");
+				return;
+			}
+		} else if (!cgroup::initNsFromParent(nsjconf, getpid())) {
 			LOG_E("Couldn't initialize net user namespace");
 			return;
 		}
@@ -164,7 +181,7 @@ static void subprocNewProc(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err
 		putenv(const_cast<char*>(env.c_str()));
 	}
 
-	auto connstr = net::connToText(fd_in, /* remote= */ true, NULL);
+	auto connstr = net::connToText(netfd, /* remote= */ true, NULL);
 	LOG_I("Executing '%s' for '%s'", nsjconf->exec_file.c_str(), connstr.c_str());
 
 	std::vector<const char*> argv;
@@ -181,8 +198,8 @@ static void subprocNewProc(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err
 
 	if (nsjconf->use_execveat) {
 #if defined(__NR_execveat)
-		syscall(__NR_execveat, (uintptr_t)nsjconf->exec_fd, "", (char* const*)argv.data(),
-		    environ, (uintptr_t)AT_EMPTY_PATH);
+		util::syscall(__NR_execveat, nsjconf->exec_fd, (uintptr_t) "",
+		    (uintptr_t)argv.data(), (uintptr_t)environ, AT_EMPTY_PATH);
 #else  /* defined(__NR_execveat) */
 		LOG_E("Your system doesn't support execveat() syscall");
 		return;
@@ -197,7 +214,6 @@ static void subprocNewProc(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err
 static void addProc(nsjconf_t* nsjconf, pid_t pid, int sock) {
 	pids_t p;
 
-	p.pid = pid;
 	p.start = time(NULL);
 	p.remote_txt = net::connToText(sock, /* remote= */ true, &p.remote_addr);
 
@@ -205,24 +221,27 @@ static void addProc(nsjconf_t* nsjconf, pid_t pid, int sock) {
 	snprintf(fname, sizeof(fname), "/proc/%d/syscall", (int)pid);
 	p.pid_syscall_fd = TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_CLOEXEC));
 
-	nsjconf->pids.push_back(p);
+	if (nsjconf->pids.find(pid) != nsjconf->pids.end()) {
+		LOG_F("pid=%d already exists", pid);
+	}
+	nsjconf->pids.insert(std::make_pair(pid, p));
 
-	LOG_D("Added pid '%d' with start time '%u' to the queue for IP: '%s'", p.pid,
+	LOG_D("Added pid=%d with start time '%u' to the queue for IP: '%s'", pid,
 	    (unsigned int)p.start, p.remote_txt.c_str());
 }
 
 static void removeProc(nsjconf_t* nsjconf, pid_t pid) {
-	for (auto p = nsjconf->pids.begin(); p != nsjconf->pids.end(); ++p) {
-		if (p->pid == pid) {
-			LOG_D("Removing pid '%d' from the queue (IP:'%s', start time:'%s')", p->pid,
-			    p->remote_txt.c_str(), util::timeToStr(p->start).c_str());
-			close(p->pid_syscall_fd);
-			nsjconf->pids.erase(p);
-
-			return;
-		}
+	if (nsjconf->pids.find(pid) == nsjconf->pids.end()) {
+		LOG_W("pid=%d doesn't exist ?", pid);
+		return;
 	}
-	LOG_W("PID: %d not found (?)", pid);
+
+	const auto& p = nsjconf->pids[pid];
+	LOG_D("Removed pid=%d from the queue (IP:'%s', start time:'%s')", pid, p.remote_txt.c_str(),
+	    util::timeToStr(p.start).c_str());
+
+	close(p.pid_syscall_fd);
+	nsjconf->pids.erase(pid);
 }
 
 int countProc(nsjconf_t* nsjconf) {
@@ -233,37 +252,35 @@ void displayProc(nsjconf_t* nsjconf) {
 	LOG_I("Total number of spawned namespaces: %d", countProc(nsjconf));
 	time_t now = time(NULL);
 	for (const auto& pid : nsjconf->pids) {
-		time_t diff = now - pid.start;
+		time_t diff = now - pid.second.start;
 		uint64_t left = nsjconf->tlimit ? nsjconf->tlimit - (uint64_t)diff : 0;
-		LOG_I("PID: %d, Remote host: %s, Run time: %ld sec. (time left: %" PRId64 " sec.)",
-		    pid.pid, pid.remote_txt.c_str(), (long)diff, left);
+		LOG_I("pid=%d, Remote host: %s, Run time: %ld sec. (time left: %s s.)", pid.first,
+		    pid.second.remote_txt.c_str(), (long)diff,
+		    nsjconf->tlimit ? std::to_string(left).c_str() : "unlimited");
 	}
-}
-
-static const pids_t* getPidElem(nsjconf_t* nsjconf, pid_t pid) {
-	for (const auto& p : nsjconf->pids) {
-		if (p.pid == pid) {
-			return &p;
-		}
-	}
-	return NULL;
 }
 
 static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
-	LOG_W("PID: %d commited a syscall/seccomp violation and exited with SIGSYS", si->si_pid);
+	LOG_W("pid=%d committed a syscall/seccomp violation and exited with SIGSYS", si->si_pid);
 
-	const pids_t* p = getPidElem(nsjconf, si->si_pid);
-	if (p == NULL) {
-		LOG_W("PID:%d SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d", (int)si->si_pid,
-		    si->si_syscall, si->si_code, si->si_errno, si->si_signo);
-		LOG_E("Couldn't find pid element in the subproc list for PID: %d", (int)si->si_pid);
+	const auto& p = nsjconf->pids.find(si->si_pid);
+	if (p == nsjconf->pids.end()) {
+		LOG_W(
+		    "pid=%d SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d. (If "
+		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
+		    "'journalctl -ek' for possible auditd report with more data)",
+		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo);
+		LOG_E("Couldn't find pid element in the subproc list for pid=%d", (int)si->si_pid);
 		return;
 	}
 
 	char buf[4096];
-	ssize_t rdsize = util::readFromFd(p->pid_syscall_fd, buf, sizeof(buf) - 1);
+	ssize_t rdsize = util::readFromFd(p->second.pid_syscall_fd, buf, sizeof(buf) - 1);
 	if (rdsize < 1) {
-		LOG_W("PID: %d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d",
+		LOG_W(
+		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d. (If "
+		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
+		    "'journalctl -ek' for possible auditd report with more data)",
 		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo);
 		return;
 	}
@@ -275,18 +292,22 @@ static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
 	    &arg4, &arg5, &arg6, &sp, &pc);
 	if (ret == 9) {
 		LOG_W(
-		    "PID: %d, Syscall number: %td, Arguments: %#tx, %#tx, %#tx, %#tx, %#tx, %#tx, "
+		    "pid=%d, Syscall number: %td, Arguments: %#tx, %#tx, %#tx, %#tx, %#tx, %#tx, "
 		    "SP: %#tx, PC: %#tx, si_syscall: %d, si_errno: %#x",
 		    (int)si->si_pid, sc, arg1, arg2, arg3, arg4, arg5, arg6, sp, pc, si->si_syscall,
 		    si->si_errno);
 	} else if (ret == 3) {
 		LOG_W(
-		    "PID: %d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d, SP: %#tx, PC: "
-		    "%#tx",
+		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d, SP: %#tx, PC: "
+		    "%#tx (If SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' "
+		    "or 'journalctl -ek' for possible auditd report with more data)",
 		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo, arg1,
 		    arg2);
 	} else {
-		LOG_W("PID: %d, SiSyscall: %d, SiCode: %d, SiErrno: %d, Syscall string '%s'",
+		LOG_W(
+		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, Syscall string '%s'. (If "
+		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
+		    "'journalctl -ek' for possible auditd report with more data)",
 		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, buf);
 	}
 }
@@ -295,22 +316,26 @@ static int reapProc(nsjconf_t* nsjconf, pid_t pid, bool should_wait = false) {
 	int status;
 
 	if (wait4(pid, &status, should_wait ? 0 : WNOHANG, NULL) == pid) {
-		cgroup::finishFromParent(nsjconf, pid);
+		if (nsjconf->use_cgroupv2) {
+			cgroup2::finishFromParent(nsjconf, pid);
+		} else {
+			cgroup::finishFromParent(nsjconf, pid);
+		}
 
 		std::string remote_txt = "[UNKNOWN]";
-		const pids_t* elem = getPidElem(nsjconf, pid);
-		if (elem) {
-			remote_txt = elem->remote_txt;
+		const auto& p = nsjconf->pids.find(pid);
+		if (p != nsjconf->pids.end()) {
+			remote_txt = p->second.remote_txt;
 		}
 
 		if (WIFEXITED(status)) {
-			LOG_I("PID: %d (%s) exited with status: %d, (PIDs left: %d)", pid,
+			LOG_I("pid=%d (%s) exited with status: %d, (PIDs left: %d)", pid,
 			    remote_txt.c_str(), WEXITSTATUS(status), countProc(nsjconf) - 1);
 			removeProc(nsjconf, pid);
 			return WEXITSTATUS(status);
 		}
 		if (WIFSIGNALED(status)) {
-			LOG_I("PID: %d (%s) terminated with signal: %s (%d), (PIDs left: %d)", pid,
+			LOG_I("pid=%d (%s) terminated with signal: %s (%d), (PIDs left: %d)", pid,
 			    remote_txt.c_str(), util::sigName(WTERMSIG(status)).c_str(),
 			    WTERMSIG(status), countProc(nsjconf) - 1);
 			removeProc(nsjconf, pid);
@@ -343,20 +368,19 @@ int reapProc(nsjconf_t* nsjconf) {
 		if (nsjconf->tlimit == 0) {
 			continue;
 		}
-		pid_t pid = p.pid;
-		time_t diff = now - p.start;
+		pid_t pid = p.first;
+		time_t diff = now - p.second.start;
 		if ((uint64_t)diff >= nsjconf->tlimit) {
-			LOG_I("PID: %d run time >= time limit (%ld >= %" PRIu64
-			      ") (%s). Killing it",
-			    pid, (long)diff, nsjconf->tlimit, p.remote_txt.c_str());
+			LOG_I("pid=%d run time >= time limit (%ld >= %" PRIu64 ") (%s). Killing it",
+			    pid, (long)diff, nsjconf->tlimit, p.second.remote_txt.c_str());
 			/*
 			 * Probably a kernel bug - some processes cannot be killed with KILL if
 			 * they're namespaced, and in a stopped state
 			 */
 			kill(pid, SIGCONT);
-			LOG_D("Sent SIGCONT to PID: %d", pid);
+			LOG_D("Sent SIGCONT to pid=%d", pid);
 			kill(pid, SIGKILL);
-			LOG_D("Sent SIGKILL to PID: %d", pid);
+			LOG_D("Sent SIGKILL to pid=%d", pid);
 		}
 	}
 	return rv;
@@ -364,7 +388,7 @@ int reapProc(nsjconf_t* nsjconf) {
 
 void killAndReapAll(nsjconf_t* nsjconf) {
 	while (!nsjconf->pids.empty()) {
-		pid_t pid = nsjconf->pids.front().pid;
+		pid_t pid = nsjconf->pids.begin()->first;
 		if (kill(pid, SIGKILL) == 0) {
 			reapProc(nsjconf, pid, true);
 		} else {
@@ -375,15 +399,22 @@ void killAndReapAll(nsjconf_t* nsjconf) {
 
 static bool initParent(nsjconf_t* nsjconf, pid_t pid, int pipefd) {
 	if (!net::initNsFromParent(nsjconf, pid)) {
-		LOG_E("Couldn't initialize net namespace for pid '%d'", pid);
+		LOG_E("Couldn't initialize net namespace for pid=%d", pid);
 		return false;
 	}
-	if (!cgroup::initNsFromParent(nsjconf, pid)) {
-		LOG_E("Couldn't initialize cgroup user namespace for pid '%d'", pid);
+
+	if (nsjconf->use_cgroupv2) {
+		if (!cgroup2::initNsFromParent(nsjconf, pid)) {
+			LOG_E("Couldn't initialize cgroup 2 user namespace for pid=%d", pid);
+			exit(0xff);
+		}
+	} else if (!cgroup::initNsFromParent(nsjconf, pid)) {
+		LOG_E("Couldn't initialize cgroup user namespace for pid=%d", pid);
 		exit(0xff);
 	}
+
 	if (!user::initNsFromParent(nsjconf, pid)) {
-		LOG_E("Couldn't initialize user namespace for pid %d", pid);
+		LOG_E("Couldn't initialize user namespace for pid=%d", pid);
 		return false;
 	}
 	if (!util::writeToFd(pipefd, &kSubprocDoneChar, sizeof(kSubprocDoneChar))) {
@@ -393,9 +424,9 @@ static bool initParent(nsjconf_t* nsjconf, pid_t pid, int pipefd) {
 	return true;
 }
 
-bool runChild(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err) {
-	if (!net::limitConns(nsjconf, fd_in)) {
-		return true;
+pid_t runChild(nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err) {
+	if (!net::limitConns(nsjconf, netfd)) {
+		return 0;
 	}
 	unsigned long flags = 0UL;
 	flags |= (nsjconf->clone_newnet ? CLONE_NEWNET : 0);
@@ -405,54 +436,48 @@ bool runChild(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err) {
 	flags |= (nsjconf->clone_newipc ? CLONE_NEWIPC : 0);
 	flags |= (nsjconf->clone_newuts ? CLONE_NEWUTS : 0);
 	flags |= (nsjconf->clone_newcgroup ? CLONE_NEWCGROUP : 0);
+	flags |= (nsjconf->clone_newtime ? CLONE_NEWTIME : 0);
 
 	if (nsjconf->mode == MODE_STANDALONE_EXECVE) {
+		LOG_D("unshare(flags: %s)", cloneFlagsToStr(flags).c_str());
 		if (unshare(flags) == -1) {
 			PLOG_F("unshare(%s)", cloneFlagsToStr(flags).c_str());
 		}
-		subprocNewProc(nsjconf, fd_in, fd_out, fd_err, -1);
+		subprocNewProc(nsjconf, netfd, fd_in, fd_out, fd_err, -1);
 		LOG_F("Launching new process failed");
 	}
 
-	flags |= SIGCHLD;
-	LOG_D("Creating new process with clone flags:%s", cloneFlagsToStr(flags).c_str());
+	LOG_D("Creating new process with clone flags:%s and exit_signal:SIGCHLD",
+	    cloneFlagsToStr(flags).c_str());
 
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == -1) {
 		PLOG_E("socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC) failed");
-		return false;
+		return -1;
 	}
 	int child_fd = sv[0];
 	int parent_fd = sv[1];
 
-	pid_t pid = cloneProc(flags);
+	pid_t pid = cloneProc(flags, SIGCHLD);
 	if (pid == 0) {
 		close(parent_fd);
-		subprocNewProc(nsjconf, fd_in, fd_out, fd_err, child_fd);
+		subprocNewProc(nsjconf, netfd, fd_in, fd_out, fd_err, child_fd);
 		util::writeToFd(child_fd, &kSubprocErrorChar, sizeof(kSubprocErrorChar));
 		LOG_F("Launching child process failed");
 	}
 	close(child_fd);
 	if (pid == -1) {
-		if (flags & CLONE_NEWCGROUP) {
-			PLOG_E(
-			    "nsjail tried to use the CLONE_NEWCGROUP clone flag, which is "
-			    "supported under kernel versions >= 4.6 only. Try disabling this flag");
-		}
-		PLOG_E(
-		    "clone(flags=%s) failed. You probably need root privileges if your system "
-		    "doesn't support CLONE_NEWUSER. Alternatively, you might want to recompile "
-		    "your kernel with support for namespaces or check the current value of the "
-		    "kernel.unprivileged_userns_clone sysctl",
-		    cloneFlagsToStr(flags).c_str());
+		auto saved_errno = errno;
+		PLOG_W("clone(flags=%s) failed", cloneFlagsToStr(flags).c_str());
 		close(parent_fd);
-		return false;
+		errno = saved_errno;
+		return pid;
 	}
-	addProc(nsjconf, pid, fd_in);
+	addProc(nsjconf, pid, netfd);
 
 	if (!initParent(nsjconf, pid, parent_fd)) {
 		close(parent_fd);
-		return false;
+		return -1;
 	}
 
 	char rcvChar;
@@ -460,11 +485,11 @@ bool runChild(nsjconf_t* nsjconf, int fd_in, int fd_out, int fd_err) {
 	    rcvChar == kSubprocErrorChar) {
 		LOG_W("Received error message from the child process before it has been executed");
 		close(parent_fd);
-		return false;
+		return -1;
 	}
 
 	close(parent_fd);
-	return true;
+	return pid;
 }
 
 /*
@@ -485,9 +510,45 @@ static int cloneFunc(void* arg __attribute__((unused))) {
  * update the internal PID/TID caches, what can lead to invalid values being returned by getpid()
  * or incorrect PID/TIDs used in raise()/abort() functions
  */
-pid_t cloneProc(uintptr_t flags) {
+pid_t cloneProc(uintptr_t flags, int exit_signal) {
+	exit_signal &= CSIGNAL;
+
 	if (flags & CLONE_VM) {
 		LOG_E("Cannot use clone(flags & CLONE_VM)");
+		errno = 0;
+		return -1;
+	}
+
+	if (flags & CLONE_NEWTIME) {
+		LOG_W(
+		    "CLONE_NEWTIME reuqested, but it's only supported with the unshare() mode "
+		    "(-Me)");
+	}
+
+#if defined(__NR_clone3)
+	struct clone_args ca = {
+	    .flags = (uint64_t)flags,
+	    .pidfd = 0,
+	    .child_tid = 0,
+	    .parent_tid = 0,
+	    .exit_signal = (uint64_t)exit_signal,
+	    .stack = 0,
+	    .stack_size = 0,
+	    .tls = 0,
+	    .set_tid = 0,
+	    .set_tid_size = 0,
+	    .cgroup = 0,
+	};
+
+	pid_t ret = util::syscall(__NR_clone3, (uintptr_t)&ca, sizeof(ca));
+	if (ret != -1 || errno != ENOSYS) {
+		return ret;
+	}
+#endif /* defined(__NR_clone3) */
+
+	if (flags & CLONE_NEWTIME) {
+		LOG_E("CLONE_NEWTIME was requested but clone3() is not supported");
+		errno = 0;
 		return -1;
 	}
 
@@ -500,7 +561,7 @@ pid_t cloneProc(uintptr_t flags) {
 		 */
 		void* stack = &cloneStack[sizeof(cloneStack) / 2];
 		/* Parent */
-		return clone(cloneFunc, stack, flags, NULL, NULL, NULL);
+		return clone(cloneFunc, stack, flags | exit_signal, NULL, NULL, NULL);
 	}
 	/* Child */
 	return 0;
@@ -557,7 +618,7 @@ int systemExe(const std::vector<std::string>& args, char** env) {
 		}
 		if (WIFEXITED(status)) {
 			int exit_code = WEXITSTATUS(status);
-			LOG_D("PID %d exited with exit code: %d", pid, exit_code);
+			LOG_D("pid=%d exited with exit code: %d", pid, exit_code);
 			if (exec_failed) {
 				return -1;
 			} else if (exit_code == 0) {
@@ -568,7 +629,7 @@ int systemExe(const std::vector<std::string>& args, char** env) {
 		}
 		if (WIFSIGNALED(status)) {
 			int exit_signal = WTERMSIG(status);
-			LOG_W("PID %d killed by signal: %d (%s)", pid, exit_signal,
+			LOG_W("pid=%d killed by signal: %d (%s)", pid, exit_signal,
 			    util::sigName(exit_signal).c_str());
 			return 2;
 		}

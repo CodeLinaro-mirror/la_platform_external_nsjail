@@ -1,6 +1,6 @@
 /*
 
-   nsjail - subprocess management
+   nsjail - cgroup2 namespacing
    -----------------------------------------
 
    Copyright 2014 Google Inc. All Rights Reserved.
@@ -19,30 +19,20 @@
 
 */
 
-#ifndef NS_PROC_H
-#define NS_PROC_H
+#ifndef NS_CGROUP2_H
+#define NS_CGROUP2_H
 
-#include <inttypes.h>
 #include <stdbool.h>
-#include <unistd.h>
-
-#include <string>
-#include <vector>
+#include <stddef.h>
 
 #include "nsjail.h"
 
-namespace subproc {
+namespace cgroup2 {
 
-/* 0 - network connection limit reached, -1 - error */
-pid_t runChild(nsjconf_t* nsjconf, int listen_fd, int fd_in, int fd_out, int fd_err);
-int countProc(nsjconf_t* nsjconf);
-void displayProc(nsjconf_t* nsjconf);
-void killAndReapAll(nsjconf_t* nsjconf);
-/* Returns the exit code of the first failing subprocess, or 0 if none fail */
-int reapProc(nsjconf_t* nsjconf);
-int systemExe(const std::vector<std::string>& args, char** env);
-pid_t cloneProc(uintptr_t flags, int exit_signal);
+bool initNsFromParent(nsjconf_t* nsjconf, pid_t pid);
+bool initNs(void);
+void finishFromParent(nsjconf_t* nsjconf, pid_t pid);
 
-}  // namespace subproc
+}  // namespace cgroup2
 
-#endif /* NS_PROC_H */
+#endif /* _CGROUP2_H */

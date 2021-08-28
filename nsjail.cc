@@ -21,6 +21,8 @@
 
 #include "nsjail.h"
 
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,7 +33,10 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <memory>
+#include <vector>
 
 #include "cmdline.h"
 #include "logs.h"
@@ -47,10 +52,7 @@ static __thread int sigFatal = 0;
 static __thread bool showProc = false;
 
 static void sigHandler(int sig) {
-	if (sig == SIGALRM) {
-		return;
-	}
-	if (sig == SIGCHLD) {
+	if (sig == SIGALRM || sig == SIGCHLD || sig == SIGPIPE) {
 		return;
 	}
 	if (sig == SIGUSR1 || sig == SIGQUIT) {
@@ -74,7 +76,7 @@ static bool setSigHandler(int sig) {
 
 	if (sig == SIGTTIN || sig == SIGTTOU) {
 		sa.sa_handler = SIG_IGN;
-	};
+	}
 	if (sigaction(sig, &sa, NULL) == -1) {
 		PLOG_E("sigaction(%d)", sig);
 		return false;
@@ -115,6 +117,104 @@ static bool setTimer(nsjconf_t* nsjconf) {
 	return true;
 }
 
+static bool pipeTraffic(nsjconf_t* nsjconf, int listenfd) {
+	std::vector<struct pollfd> fds;
+	fds.reserve(nsjconf->pipes.size() * 3 + 1);
+	for (const auto& p : nsjconf->pipes) {
+		fds.push_back({
+		    .fd = p.sock_fd,
+		    .events = POLLIN | POLLOUT,
+		    .revents = 0,
+		});
+		fds.push_back({
+		    .fd = p.pipe_in,
+		    .events = POLLOUT,
+		    .revents = 0,
+		});
+		fds.push_back({
+		    .fd = p.pipe_out,
+		    .events = POLLIN,
+		    .revents = 0,
+		});
+	}
+	fds.push_back({
+	    .fd = listenfd,
+	    .events = POLLIN,
+	    .revents = 0,
+	});
+	LOG_D("Waiting for fd activity");
+	while (poll(fds.data(), fds.size(), -1) > 0) {
+		if (sigFatal > 0 || showProc) {
+			return false;
+		}
+		if (fds.back().revents != 0) {
+			LOG_D("New connection ready");
+			return true;
+		}
+		bool cleanup = false;
+		for (size_t i = 0; i < fds.size() - 1; ++i) {
+			if (fds[i].revents & POLLIN) {
+				fds[i].events &= ~POLLIN;
+			}
+			if (fds[i].revents & POLLOUT) {
+				fds[i].events &= ~POLLOUT;
+			}
+		}
+		for (size_t i = 0; i < fds.size() - 3; i += 3) {
+			const size_t pipe_no = i / 3;
+			int in, out;
+			const char* direction;
+			bool closed = false;
+			std::tuple<int, int, const char*> direction_map[] = {
+			    std::make_tuple(i, i + 1, "in"),
+			    std::make_tuple(i + 2, i, "out"),
+			};
+			for (const auto& entry : direction_map) {
+				std::tie(in, out, direction) = entry;
+				bool in_ready = (fds[in].events & POLLIN) == 0 ||
+						(fds[in].revents & POLLIN) == POLLIN;
+				bool out_ready = (fds[out].events & POLLOUT) == 0 ||
+						 (fds[out].revents & POLLOUT) == POLLOUT;
+				if (in_ready && out_ready) {
+					LOG_D("#%zu piping data %s", pipe_no, direction);
+					ssize_t rv = splice(fds[in].fd, nullptr, fds[out].fd,
+					    nullptr, 4096, SPLICE_F_NONBLOCK);
+					if (rv == -1 && errno != EAGAIN) {
+						PLOG_E("splice fd pair #%zu {%d, %d}\n", pipe_no,
+						    fds[in].fd, fds[out].fd);
+					}
+					if (rv == 0) {
+						closed = true;
+					}
+					fds[in].events |= POLLIN;
+					fds[out].events |= POLLOUT;
+				}
+				if ((fds[in].revents & (POLLERR | POLLHUP)) != 0 ||
+				    (fds[out].revents & (POLLERR | POLLHUP)) != 0) {
+					closed = true;
+				}
+			}
+			if (closed) {
+				LOG_D("#%zu connection closed", pipe_no);
+				cleanup = true;
+				close(nsjconf->pipes[pipe_no].sock_fd);
+				close(nsjconf->pipes[pipe_no].pipe_in);
+				close(nsjconf->pipes[pipe_no].pipe_out);
+				if (nsjconf->pipes[pipe_no].pid > 0) {
+					kill(nsjconf->pipes[pipe_no].pid, SIGKILL);
+				}
+				nsjconf->pipes[pipe_no] = {};
+			}
+		}
+		if (cleanup) {
+			break;
+		}
+	}
+	nsjconf->pipes.erase(std::remove(nsjconf->pipes.begin(), nsjconf->pipes.end(), pipemap_t{}),
+	    nsjconf->pipes.end());
+	return false;
+}
+
 static int listenMode(nsjconf_t* nsjconf) {
 	int listenfd = net::getRecvSocket(nsjconf->bindhost.c_str(), nsjconf->port);
 	if (listenfd == -1) {
@@ -131,10 +231,35 @@ static int listenMode(nsjconf_t* nsjconf) {
 			showProc = false;
 			subproc::displayProc(nsjconf);
 		}
-		int connfd = net::acceptConn(listenfd);
-		if (connfd >= 0) {
-			subproc::runChild(nsjconf, connfd, connfd, connfd);
-			close(connfd);
+		if (pipeTraffic(nsjconf, listenfd)) {
+			int connfd = net::acceptConn(listenfd);
+			if (connfd >= 0) {
+				int in[2];
+				int out[2];
+				if (pipe(in) != 0 || pipe(out) != 0) {
+					PLOG_E("pipe");
+					continue;
+				}
+
+				pid_t pid =
+				    subproc::runChild(nsjconf, connfd, in[0], out[1], out[1]);
+
+				close(in[0]);
+				close(out[1]);
+
+				if (pid <= 0) {
+					close(in[1]);
+					close(out[0]);
+					close(connfd);
+				} else {
+					nsjconf->pipes.push_back({
+					    .sock_fd = connfd,
+					    .pipe_in = in[1],
+					    .pipe_out = out[0],
+					    .pid = pid,
+					});
+				}
+			}
 		}
 		subproc::reapProc(nsjconf);
 	}
@@ -142,7 +267,8 @@ static int listenMode(nsjconf_t* nsjconf) {
 
 static int standaloneMode(nsjconf_t* nsjconf) {
 	for (;;) {
-		if (!subproc::runChild(nsjconf, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO)) {
+		if (subproc::runChild(nsjconf, /* netfd= */ -1, STDIN_FILENO, STDOUT_FILENO,
+			STDERR_FILENO) == -1) {
 			LOG_E("Couldn't launch the child process");
 			return 0xff;
 		}
@@ -188,7 +314,10 @@ void setTC(int fd, const struct termios* trm) {
 		PLOG_W("ioctl(fd=%d, TCSETS) failed", fd);
 		return;
 	}
-	LOG_D("Restored the previous state of the TTY");
+	if (tcflush(fd, TCIFLUSH) == -1) {
+		PLOG_W("tcflush(fd=%d, TCIFLUSH) failed", fd);
+		return;
+	}
 }
 
 }  // namespace nsjail
@@ -200,10 +329,7 @@ int main(int argc, char* argv[]) {
 	if (!nsjconf) {
 		LOG_F("Couldn't parse cmdline options");
 	}
-	if (!nsjconf->clone_newuser && geteuid() != 0) {
-		LOG_W("--disable_clone_newuser might require root() privs");
-	}
-	if (nsjconf->daemonize && (daemon(0, 0) == -1)) {
+	if (nsjconf->daemonize && (daemon(/* nochdir= */ 1, /* noclose= */ 0) == -1)) {
 		PLOG_F("daemon");
 	}
 	cmdline::logParams(nsjconf.get());
@@ -226,7 +352,9 @@ int main(int argc, char* argv[]) {
 
 	sandbox::closePolicy(nsjconf.get());
 	/* Try to restore the underlying console's params in case some program has changed it */
-	nsjail::setTC(STDIN_FILENO, trm.get());
+	if (!nsjconf->daemonize) {
+		nsjail::setTC(STDIN_FILENO, trm.get());
+	}
 
 	LOG_D("Returning with %d", ret);
 	return ret;

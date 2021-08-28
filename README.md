@@ -357,9 +357,9 @@ Options:
  --rw 
 	Mount chroot dir (/) R/W (default: R/O)
  --user|-u VALUE
-	Username/uid of processess inside the jail (default: your current uid). You can also use inside_ns_uid:outside_ns_uid:count convention here. Can be specified multiple times
+	Username/uid of processes inside the jail (default: your current uid). You can also use inside_ns_uid:outside_ns_uid:count convention here. Can be specified multiple times
  --group|-g VALUE
-	Groupname/gid of processess inside the jail (default: your current gid). You can also use inside_ns_gid:global_ns_gid:count convention here. Can be specified multiple times
+	Groupname/gid of processes inside the jail (default: your current gid). You can also use inside_ns_gid:global_ns_gid:count convention here. Can be specified multiple times
  --hostname|-H VALUE
 	UTS name (hostname) of the jail (default: 'NSJAIL')
  --cwd|-D VALUE
@@ -368,6 +368,8 @@ Options:
 	TCP port to bind to (enables MODE_LISTEN_TCP) (default: 0)
  --bindhost VALUE
 	IP address to bind the port to (only in [MODE_LISTEN_TCP]), (default: '::')
+ --max_conns VALUE
+	Maximum number of connections across all IPs (only in [MODE_LISTEN_TCP]), (default: 0 (unlimited))
  --max_conns_per_ip|-i VALUE
 	Maximum number of connections per one IP (only in [MODE_LISTEN_TCP]), (default: 0 (unlimited))
  --log|-l VALUE
@@ -489,7 +491,7 @@ Options:
  --cgroup_cpu_ms_per_sec VALUE
 	Number of milliseconds of CPU time per second that the process group can use (default: '0' - no limit)
  --cgroup_cpu_mount VALUE
-	Location of cpu cgroup FS (default: '/sys/fs/cgroup/net_cls')
+	Location of cpu cgroup FS (default: '/sys/fs/cgroup/cpu')
  --cgroup_cpu_parent VALUE
 	Which pre-existing cpu cgroup to use as a parent (default: 'NSJAIL')
  --iface_no_lo 

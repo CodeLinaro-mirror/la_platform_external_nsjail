@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -44,10 +45,10 @@ static const int nssigs[] = {
     SIGTERM,
     SIGTTIN,
     SIGTTOU,
+    SIGPIPE,
 };
 
 struct pids_t {
-	pid_t pid;
 	time_t start;
 	std::string remote_txt;
 	struct sockaddr_in6 remote_addr;
@@ -81,6 +82,16 @@ enum ns_mode_t {
 	MODE_STANDALONE_RERUN
 };
 
+struct pipemap_t {
+	int sock_fd;
+	int pipe_in;
+	int pipe_out;
+	pid_t pid;
+	bool operator==(const pipemap_t& o) {
+		return sock_fd == o.sock_fd && pipe_in == o.pipe_in && pipe_out == o.pipe_out;
+	}
+};
+
 struct nsjconf_t {
 	std::string exec_file;
 	bool use_execveat;
@@ -104,19 +115,26 @@ struct nsjconf_t {
 	uint64_t rl_nofile;
 	uint64_t rl_nproc;
 	uint64_t rl_stack;
+	uint64_t rl_mlock;
+	uint64_t rl_rtpr;
+	uint64_t rl_msgq;
+	bool disable_rl;
 	unsigned long personality;
 	bool clone_newnet;
 	bool clone_newuser;
 	bool clone_newns;
+	bool no_pivotroot;
 	bool clone_newpid;
 	bool clone_newipc;
 	bool clone_newuts;
 	bool clone_newcgroup;
+	bool clone_newtime;
 	enum ns_mode_t mode;
 	bool is_root_rw;
 	bool is_silent;
 	bool stderr_to_null;
 	bool skip_setsid;
+	unsigned int max_conns;
 	unsigned int max_conns_per_ip;
 	std::string proc_path;
 	bool is_proc_rw;
@@ -126,6 +144,7 @@ struct nsjconf_t {
 	std::string iface_vs_nm;
 	std::string iface_vs_gw;
 	std::string iface_vs_ma;
+	std::string iface_vs_mo;
 	std::string cgroup_mem_mount;
 	std::string cgroup_mem_parent;
 	size_t cgroup_mem_max;
@@ -138,20 +157,25 @@ struct nsjconf_t {
 	std::string cgroup_cpu_mount;
 	std::string cgroup_cpu_parent;
 	unsigned int cgroup_cpu_ms_per_sec;
+	std::string cgroupv2_mount;
+	bool use_cgroupv2;
 	std::string kafel_file_path;
 	std::string kafel_string;
 	struct sock_fprog seccomp_fprog;
 	bool seccomp_log;
+	int nice_level;
 	long num_cpus;
 	uid_t orig_uid;
+	uid_t orig_euid;
 	std::vector<mount_t> mountpts;
-	std::vector<pids_t> pids;
+	std::map<pid_t, pids_t> pids;
 	std::vector<idmap_t> uids;
 	std::vector<idmap_t> gids;
 	std::vector<std::string> envs;
 	std::vector<int> openfds;
 	std::vector<int> caps;
 	std::vector<std::string> ifaces;
+	std::vector<pipemap_t> pipes;
 };
 
 #endif /* _NSJAIL_H */
