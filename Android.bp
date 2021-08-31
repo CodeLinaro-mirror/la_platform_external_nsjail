@@ -12,9 +12,11 @@ cc_binary_host {
         "-Wno-unused-parameter",
     ],
     cppflags: ["-fno-exceptions"],
+    shared_libs: ["libnl"],
     srcs: [
         "caps.cc",
         "cgroup.cc",
+        "cgroup2.cc",
         "cmdline.cc",
         "config.cc",
         "contain.cc",

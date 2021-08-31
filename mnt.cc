@@ -37,7 +37,6 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <syscall.h>
 #include <unistd.h>
 
 #include <memory>
@@ -179,8 +178,8 @@ static bool mountPt(mount_t* mpt, const char* newroot, const char* tmpdir) {
 			return false;
 		}
 		if (!util::writeToFd(fd, mpt->src_content.data(), mpt->src_content.length())) {
-			LOG_W("Writting %zu bytes to '%s' failed", mpt->src_content.length(),
-			    srcpath);
+			LOG_W(
+			    "Writing %zu bytes to '%s' failed", mpt->src_content.length(), srcpath);
 			close(fd);
 			return false;
 		}
@@ -283,6 +282,13 @@ static bool mkdirAndTest(const std::string& dir) {
 static std::unique_ptr<std::string> getDir(nsjconf_t* nsjconf, const char* name) {
 	std::unique_ptr<std::string> dir(new std::string);
 
+	dir->assign("/run/user/").append(std::to_string(nsjconf->orig_uid)).append("/nsjail");
+	if (mkdirAndTest(*dir)) {
+		dir->append("/").append(name);
+		if (mkdirAndTest(*dir)) {
+			return dir;
+		}
+	}
 	dir->assign("/run/user/")
 	    .append("/nsjail.")
 	    .append(std::to_string(nsjconf->orig_uid))
@@ -331,29 +337,26 @@ static std::unique_ptr<std::string> getDir(nsjconf_t* nsjconf, const char* name)
 	return nullptr;
 }
 
-static bool initNsInternal(nsjconf_t* nsjconf) {
+static bool initNoCloneNs(nsjconf_t* nsjconf) {
 	/*
 	 * If CLONE_NEWNS is not used, we would be changing the global mount namespace, so simply
 	 * use --chroot in this case
 	 */
-	if (!nsjconf->clone_newns) {
-		if (nsjconf->chroot.empty()) {
-			PLOG_E(
-			    "--chroot was not specified, and it's required when not using "
-			    "CLONE_NEWNS");
-			return false;
-		}
-		if (chroot(nsjconf->chroot.c_str()) == -1) {
-			PLOG_E("chroot('%s')", nsjconf->chroot.c_str());
-			return false;
-		}
-		if (chdir("/") == -1) {
-			PLOG_E("chdir('/')");
-			return false;
-		}
+	if (nsjconf->chroot.empty()) {
 		return true;
 	}
+	if (chroot(nsjconf->chroot.c_str()) == -1) {
+		PLOG_E("chroot('%s')", nsjconf->chroot.c_str());
+		return false;
+	}
+	if (chdir("/") == -1) {
+		PLOG_E("chdir('/')");
+		return false;
+	}
+	return true;
+}
 
+static bool initCloneNs(nsjconf_t* nsjconf) {
 	if (chdir("/") == -1) {
 		PLOG_E("chdir('/')");
 		return false;
@@ -395,25 +398,63 @@ static bool initNsInternal(nsjconf_t* nsjconf) {
 		PLOG_E("umount2('%s', MNT_DETACH)", tmpdir->c_str());
 		return false;
 	}
-	/*
-	 * This requires some explanation: It's actually possible to pivot_root('/', '/'). After
-	 * this operation has been completed, the old root is mounted over the new root, and it's OK
-	 * to simply umount('/') now, and to have new_root as '/'. This allows us not care about
-	 * providing any special directory for old_root, which is sometimes not easy, given that
-	 * e.g. /tmp might not always be present inside new_root
-	 */
-	if (syscall(__NR_pivot_root, destdir->c_str(), destdir->c_str()) == -1) {
-		PLOG_E("pivot_root('%s', '%s')", destdir->c_str(), destdir->c_str());
-		return false;
-	}
 
-	if (umount2("/", MNT_DETACH) == -1) {
-		PLOG_E("umount2('/', MNT_DETACH)");
-		return false;
-	}
-	if (chdir(nsjconf->cwd.c_str()) == -1) {
-		PLOG_E("chdir('%s')", nsjconf->cwd.c_str());
-		return false;
+	if (!nsjconf->no_pivotroot) {
+		/*
+		 * This requires some explanation: It's actually possible to pivot_root('/', '/').
+		 * After this operation has been completed, the old root is mounted over the new
+		 * root, and it's OK to simply umount('/') now, and to have new_root as '/'. This
+		 * allows us not care about providing any special directory for old_root, which is
+		 * sometimes not easy, given that e.g. /tmp might not always be present inside
+		 * new_root
+		 */
+		if (util::syscall(__NR_pivot_root, (uintptr_t)destdir->c_str(),
+			(uintptr_t)destdir->c_str()) == -1) {
+			PLOG_E("pivot_root('%s', '%s')", destdir->c_str(), destdir->c_str());
+			return false;
+		}
+
+		if (umount2("/", MNT_DETACH) == -1) {
+			PLOG_E("umount2('/', MNT_DETACH)");
+			return false;
+		}
+	} else {
+		/*
+		 * pivot_root would normally un-mount the old root, however in certain cases this
+		 * operation is forbidden. There are systems (mainly embedded) that keep their root
+		 * file system in RAM, when initially loaded by the kernel (e.g. initramfs),
+		 * and there is no other file system that is mounted on top of it.In such systems,
+		 * there is no option to pivot_root!
+		 * For more information, see
+		 * kernel.org/doc/Documentation/filesystems/ramfs-rootfs-initramfs.txt. switch_root
+		 * alternative: Innstead of un-mounting the old rootfs, it is over mounted by moving
+		 * the new root to it.
+		 */
+
+		/* NOTE: Using mount move and chroot allows escaping back into the old root when
+		 * proper capabilities are kept in the user namespace. It can be acheived by
+		 * unmounting the new root and using setns to re-enter the mount namespace.
+		 */
+		LOG_W(
+		    "Using no_pivotroot is escapable when user posseses relevant capabilities, "
+		    "Use it with care!");
+
+		if (chdir(destdir->c_str()) == -1) {
+			PLOG_E("chdir('%s')", destdir->c_str());
+			return false;
+		}
+
+		/* mount moving the new root on top of '/'. This operation is atomic and doesn't
+		involve un-mounting '/' at any stage */
+		if (mount(".", "/", NULL, MS_MOVE, NULL) == -1) {
+			PLOG_E("mount('/', %s, NULL, MS_MOVE, NULL)", destdir->c_str());
+			return false;
+		}
+
+		if (chroot(".") == -1) {
+			PLOG_E("chroot('%s')", destdir->c_str());
+			return false;
+		}
 	}
 
 	for (const auto& p : nsjconf->mountpts) {
@@ -422,6 +463,24 @@ static bool initNsInternal(nsjconf_t* nsjconf) {
 		}
 	}
 
+	return true;
+}
+
+static bool initNsInternal(nsjconf_t* nsjconf) {
+	if (nsjconf->clone_newns) {
+		if (!initCloneNs(nsjconf)) {
+			return false;
+		}
+	} else {
+		if (!initNoCloneNs(nsjconf)) {
+			return false;
+		}
+	}
+
+	if (chdir(nsjconf->cwd.c_str()) == -1) {
+		PLOG_E("chdir('%s')", nsjconf->cwd.c_str());
+		return false;
+	}
 	return true;
 }
 
@@ -434,7 +493,7 @@ bool initNs(nsjconf_t* nsjconf) {
 		return initNsInternal(nsjconf);
 	}
 
-	pid_t pid = subproc::cloneProc(CLONE_FS | SIGCHLD);
+	pid_t pid = subproc::cloneProc(CLONE_FS, SIGCHLD);
 	if (pid == -1) {
 		return false;
 	}
@@ -459,7 +518,7 @@ static bool addMountPt(mount_t* mnt, const std::string& src, const std::string& 
 	if (!src_env.empty()) {
 		const char* e = getenv(src_env.c_str());
 		if (e == NULL) {
-			LOG_W("No such envvar:'%s'", src_env.c_str());
+			LOG_W("No such envar:'%s'", src_env.c_str());
 			return false;
 		}
 		mnt->src = e;
@@ -469,7 +528,7 @@ static bool addMountPt(mount_t* mnt, const std::string& src, const std::string& 
 	if (!dst_env.empty()) {
 		const char* e = getenv(dst_env.c_str());
 		if (e == NULL) {
-			LOG_W("No such envvar:'%s'", dst_env.c_str());
+			LOG_W("No such envar:'%s'", dst_env.c_str());
 			return false;
 		}
 		mnt->dst = e;
@@ -553,9 +612,9 @@ const std::string describeMountPt(const mount_t& mpt) {
 	    .append("'");
 
 	if (mpt.is_dir) {
-		descr.append(" is_dir:true");
+		descr.append(" dir:true");
 	} else {
-		descr.append(" is_dir:false");
+		descr.append(" dir:false");
 	}
 	if (!mpt.is_mandatory) {
 		descr.append(" mandatory:false");

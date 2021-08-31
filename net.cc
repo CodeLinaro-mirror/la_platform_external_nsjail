@@ -23,6 +23,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <net/route.h>
 #include <netinet/in.h>
@@ -50,7 +51,6 @@ namespace net {
 
 #define IFACE_NAME "vs"
 
-#if defined(NSJAIL_NL3_WITH_MACVLAN)
 #include <netlink/route/link.h>
 #include <netlink/route/link/macvlan.h>
 
@@ -85,6 +85,12 @@ static bool cloneIface(
 		nl_addr_put(nladdr);
 	}
 
+	if ((err = rtnl_link_macvlan_set_mode(
+		 rmv, rtnl_link_macvlan_str2mode(nsjconf->iface_vs_mo.c_str()))) < 0) {
+		LOG_E("rtnl_link_macvlan_set_mode(mode:'%s') failed: %s",
+		    nsjconf->iface_vs_mo.c_str(), nl_geterror(err));
+	}
+
 	if ((err = rtnl_link_add(sk, rmv, NLM_F_CREATE)) < 0) {
 		LOG_E("rtnl_link_add(name:'%s' link:'%s'): %s", IFACE_NAME,
 		    nsjconf->iface_vs.c_str(), nl_geterror(err));
@@ -116,7 +122,7 @@ static bool moveToNs(
 
 	int err = rtnl_link_change(sk, orig_link, new_link, RTM_SETLINK);
 	if (err < 0) {
-		LOG_E("rtnl_link_change(): set NS of interface '%s' to PID=%d: %s", iface.c_str(),
+		LOG_E("rtnl_link_change(): set NS of interface '%s' to pid=%d: %s", iface.c_str(),
 		    (int)pid, nl_geterror(err));
 		rtnl_link_put(new_link);
 		rtnl_link_put(orig_link);
@@ -169,52 +175,6 @@ bool initNsFromParent(nsjconf_t* nsjconf, int pid) {
 	nl_socket_free(sk);
 	return true;
 }
-#else   // defined(NSJAIL_NL3_WITH_MACVLAN)
-
-static bool moveToNs(const std::string& iface, pid_t pid) {
-	const std::vector<std::string> argv{
-	    "/sbin/ip", "link", "set", iface, "netns", std::to_string(pid)};
-	if (subproc::systemExe(argv, environ) != 0) {
-		LOG_E("Couldn't put interface '%s' into NET ns of the PID=%d", iface.c_str(),
-		    (int)pid);
-		return false;
-	}
-	return true;
-}
-
-bool initNsFromParent(nsjconf_t* nsjconf, int pid) {
-	if (!nsjconf->clone_newnet) {
-		return true;
-	}
-	for (const auto& iface : nsjconf->ifaces) {
-		if (!moveToNs(iface, pid)) {
-			return false;
-		}
-	}
-	if (nsjconf->iface_vs.empty()) {
-		return true;
-	}
-
-	LOG_D("Putting iface:'%s' into namespace of PID:%d (with /sbin/ip)",
-	    nsjconf->iface_vs.c_str(), pid);
-
-	std::vector<std::string> argv;
-
-	if (nsjconf->iface_vs_ma != "") {
-		argv = {"/sbin/ip", "link", "add", "link", nsjconf->iface_vs, "name", IFACE_NAME,
-		    "netns", std::to_string(pid), "address", nsjconf->iface_vs_ma, "type",
-		    "macvlan", "mode", "bridge"};
-	} else {
-		argv = {"/sbin/ip", "link", "add", "link", nsjconf->iface_vs, "name", IFACE_NAME,
-		    "netns", std::to_string(pid), "type", "macvlan", "mode", "bridge"};
-	}
-	if (subproc::systemExe(argv, environ) != 0) {
-		LOG_E("Couldn't create MACVTAP interface for '%s'", nsjconf->iface_vs.c_str());
-		return false;
-	}
-	return true;
-}
-#endif  // defined(NSJAIL_NL3_WITH_MACVLAN)
 
 static bool isSocket(int fd) {
 	int optval;
@@ -228,6 +188,12 @@ static bool isSocket(int fd) {
 
 bool limitConns(nsjconf_t* nsjconf, int connsock) {
 	/* 0 means 'unlimited' */
+	if (nsjconf->max_conns != 0 && nsjconf->pids.size() >= nsjconf->max_conns) {
+		LOG_W("Rejecting connection, max_conns limit reached: %u", nsjconf->max_conns);
+		return false;
+	}
+
+	/* 0 means 'unlimited' */
 	if (nsjconf->max_conns_per_ip == 0) {
 		return true;
 	}
@@ -237,8 +203,8 @@ bool limitConns(nsjconf_t* nsjconf, int connsock) {
 
 	unsigned cnt = 0;
 	for (const auto& pid : nsjconf->pids) {
-		if (memcmp(addr.sin6_addr.s6_addr, pid.remote_addr.sin6_addr.s6_addr,
-			sizeof(pid.remote_addr.sin6_addr.s6_addr)) == 0) {
+		if (memcmp(addr.sin6_addr.s6_addr, pid.second.remote_addr.sin6_addr.s6_addr,
+			sizeof(pid.second.remote_addr.sin6_addr.s6_addr)) == 0) {
 			cnt++;
 		}
 	}
@@ -252,7 +218,7 @@ bool limitConns(nsjconf_t* nsjconf, int connsock) {
 }
 
 int getRecvSocket(const char* bindhost, int port) {
-	if (port < 1 || port > 65535) {
+	if (port < 0 || port > 65535) {
 		LOG_F(
 		    "TCP port %d out of bounds (0 <= port <= 65535), specify one with --port "
 		    "<port>",
@@ -277,6 +243,10 @@ int getRecvSocket(const char* bindhost, int port) {
 	int sockfd = socket(AF_INET6, SOCK_STREAM, 0);
 	if (sockfd == -1) {
 		PLOG_E("socket(AF_INET6)");
+		return -1;
+	}
+	if (fcntl(sockfd, F_SETFL, O_NONBLOCK)) {
+		PLOG_E("fcntl(%d, F_SETFL, O_NONBLOCK)", sockfd);
 		return -1;
 	}
 	int so = 1;
@@ -311,7 +281,7 @@ int getRecvSocket(const char* bindhost, int port) {
 int acceptConn(int listenfd) {
 	struct sockaddr_in6 cli_addr;
 	socklen_t socklen = sizeof(cli_addr);
-	int connfd = accept(listenfd, (struct sockaddr*)&cli_addr, &socklen);
+	int connfd = accept4(listenfd, (struct sockaddr*)&cli_addr, &socklen, SOCK_NONBLOCK);
 	if (connfd == -1) {
 		if (errno != EINTR) {
 			PLOG_E("accept(%d)", listenfd);

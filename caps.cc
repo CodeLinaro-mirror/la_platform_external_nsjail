@@ -21,6 +21,7 @@
 
 #include "caps.h"
 
+#include <errno.h>
 #include <linux/capability.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -80,6 +81,15 @@ struct {
 #if defined(CAP_AUDIT_READ)
     NS_VALSTR_STRUCT(CAP_AUDIT_READ),
 #endif /* defined(CAP_AUDIT_READ) */
+#if defined(CAP_BPF)
+    NS_VALSTR_STRUCT(CAP_BPF),
+#endif /* defined(CAP_BPF) */
+#if defined(CAP_PERFMON)
+    NS_VALSTR_STRUCT(CAP_PERFMON),
+#endif /* defined(CAP_PERFMON) */
+#if defined(CAP_CHECKPOINT_RESTORE)
+    NS_VALSTR_STRUCT(CAP_CHECKPOINT_RESTORE),
+#endif /* defined(CAP_CHECKPOINT_RESTORE) */
 };
 
 int nameToVal(const char* name) {
@@ -88,7 +98,7 @@ int nameToVal(const char* name) {
 			return cap.val;
 		}
 	}
-	LOG_W("Uknown capability: '%s'", name);
+	LOG_W("Unknown capability: '%s'", name);
 	return -1;
 }
 
@@ -112,7 +122,7 @@ static cap_user_data_t getCaps() {
 	    .version = _LINUX_CAPABILITY_VERSION_3,
 	    .pid = 0,
 	};
-	if (syscall(__NR_capget, &cap_hdr, &cap_data) == -1) {
+	if (util::syscall(__NR_capget, (uintptr_t)&cap_hdr, (uintptr_t)&cap_data) == -1) {
 		PLOG_W("capget() failed");
 		return NULL;
 	}
@@ -124,7 +134,7 @@ static bool setCaps(const cap_user_data_t cap_data) {
 	    .version = _LINUX_CAPABILITY_VERSION_3,
 	    .pid = 0,
 	};
-	if (syscall(__NR_capset, &cap_hdr, cap_data) == -1) {
+	if (util::syscall(__NR_capset, (uintptr_t)&cap_hdr, (uintptr_t)cap_data) == -1) {
 		PLOG_W("capset() failed");
 		return false;
 	}
@@ -245,6 +255,11 @@ bool initNs(nsjconf_t* nsjconf) {
 	if (getEffective(cap_data, CAP_SETPCAP)) {
 		for (const auto& i : capNames) {
 			if (getInheritable(cap_data, i.val)) {
+				continue;
+			}
+			if (prctl(PR_CAPBSET_READ, (unsigned long)i.val, 0UL, 0UL, 0UL) == -1 &&
+			    errno == EINVAL) {
+				LOG_D("Skipping unsupported capability: %s", i.name);
 				continue;
 			}
 			dbgmsg.append(" ").append(i.name);
