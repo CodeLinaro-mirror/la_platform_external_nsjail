@@ -145,9 +145,12 @@ struct nsjconf_t {
 	std::string iface_vs_gw;
 	std::string iface_vs_ma;
 	std::string iface_vs_mo;
+	bool disable_tsc;
 	std::string cgroup_mem_mount;
 	std::string cgroup_mem_parent;
 	size_t cgroup_mem_max;
+	size_t cgroup_mem_memsw_max;
+	ssize_t cgroup_mem_swap_max;
 	std::string cgroup_pids_mount;
 	std::string cgroup_pids_parent;
 	unsigned int cgroup_pids_max;

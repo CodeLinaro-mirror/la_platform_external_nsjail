@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -103,7 +104,7 @@ struct custom_option custom_opts[] = {
     { { "skip_setsid", no_argument, NULL, 0x0504 }, "Don't call setsid(), allows for terminal signal handling in the sandboxed process. Dangerous" },
     { { "pass_fd", required_argument, NULL, 0x0505 }, "Don't close this FD before executing the child process (can be specified multiple times), by default: 0/1/2 are kept open" },
     { { "disable_no_new_privs", no_argument, NULL, 0x0507 }, "Don't set the prctl(NO_NEW_PRIVS, 1) (DANGEROUS)" },
-    { { "rlimit_as", required_argument, NULL, 0x0201 }, "RLIMIT_AS in MB, 'max' or 'hard' for the current hard limit, 'def' or 'soft' for the current soft limit, 'inf' for RLIM64_INFINITY (default: 512)" },
+    { { "rlimit_as", required_argument, NULL, 0x0201 }, "RLIMIT_AS in MB, 'max' or 'hard' for the current hard limit, 'def' or 'soft' for the current soft limit, 'inf' for RLIM64_INFINITY (default: 4096)" },
     { { "rlimit_core", required_argument, NULL, 0x0202 }, "RLIMIT_CORE in MB, 'max' or 'hard' for the current hard limit, 'def' or 'soft' for the current soft limit, 'inf' for RLIM64_INFINITY (default: 0)" },
     { { "rlimit_cpu", required_argument, NULL, 0x0203 }, "RLIMIT_CPU, 'max' or 'hard' for the current hard limit, 'def' or 'soft' for the current soft limit, 'inf' for RLIM64_INFINITY (default: 600)" },
     { { "rlimit_fsize", required_argument, NULL, 0x0204 }, "RLIMIT_FSIZE in MB, 'max' or 'hard' for the current hard limit, 'def' or 'soft' for the current soft limit, 'inf' for RLIM64_INFINITY (default: 1)" },
@@ -142,6 +143,8 @@ struct custom_option custom_opts[] = {
     { { "seccomp_log", no_argument, NULL, 0x0902 }, "Use SECCOMP_FILTER_FLAG_LOG. Log all actions except SECCOMP_RET_ALLOW). Supported since kernel version 4.14" },
     { { "nice_level", required_argument, NULL, 0x0903 }, "Set jailed process niceness (-20 is highest -priority, 19 is lowest). By default, set to 19" },
     { { "cgroup_mem_max", required_argument, NULL, 0x0801 }, "Maximum number of bytes to use in the group (default: '0' - disabled)" },
+    { { "cgroup_mem_memsw_max", required_argument, NULL, 0x0804 }, "Maximum number of memory+swap bytes to use (default: '0' - disabled)" },
+    { { "cgroup_mem_swap_max", required_argument, NULL, 0x0805 }, "Maximum number of swap bytes to use (default: '-1' - disabled)" },
     { { "cgroup_mem_mount", required_argument, NULL, 0x0802 }, "Location of memory cgroup FS (default: '/sys/fs/cgroup/memory')" },
     { { "cgroup_mem_parent", required_argument, NULL, 0x0803 }, "Which pre-existing memory cgroup to use as a parent (default: 'NSJAIL')" },
     { { "cgroup_pids_max", required_argument, NULL, 0x0811 }, "Maximum number of pids in a cgroup (default: '0' - disabled)" },
@@ -163,6 +166,7 @@ struct custom_option custom_opts[] = {
     { { "macvlan_vs_gw", required_argument, NULL, 0x703 }, "Default GW for the 'vs' interface (e.g. \"192.168.0.1\")" },
     { { "macvlan_vs_ma", required_argument, NULL, 0x705 }, "MAC-address of the 'vs' interface (e.g. \"ba:ad:ba:be:45:00\")" },
     { { "macvlan_vs_mo", required_argument, NULL, 0x706 }, "Mode of the 'vs' interface. Can be either 'private', 'vepa', 'bridge' or 'passthru' (default: 'private')" },
+    { { "disable_tsc", no_argument, NULL, 0x707 }, "Disable rdtsc and rdtscp instructions. WARNING: To make it effective, you also need to forbid `prctl(PR_SET_TSC, PR_TSC_ENABLE, ...)` in seccomp rules! (x86 and x86_64 only). Dynamic binaries produced by GCC seem to rely on RDTSC, but static ones should work." },
 };
 // clang-format on
 
@@ -456,6 +460,8 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 	nsjconf->cgroup_mem_mount = "/sys/fs/cgroup/memory";
 	nsjconf->cgroup_mem_parent = "NSJAIL";
 	nsjconf->cgroup_mem_max = (size_t)0;
+	nsjconf->cgroup_mem_memsw_max = (size_t)0;
+	nsjconf->cgroup_mem_swap_max = (ssize_t)-1;
 	nsjconf->cgroup_pids_mount = "/sys/fs/cgroup/pids";
 	nsjconf->cgroup_pids_parent = "NSJAIL";
 	nsjconf->cgroup_pids_max = 0U;
@@ -473,6 +479,7 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 	nsjconf->iface_vs_gw = "0.0.0.0";
 	nsjconf->iface_vs_ma = "";
 	nsjconf->iface_vs_mo = "private";
+	nsjconf->disable_tsc = false;
 	nsjconf->orig_uid = getuid();
 	nsjconf->orig_euid = geteuid();
 	nsjconf->num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -777,7 +784,12 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 				dst = src;
 			}
 			std::string fs_type = argFromVec(subopts, 2);
-			std::string options = argFromVec(subopts, 3);
+			std::stringstream optionsStream;
+			optionsStream << argFromVec(subopts, 3);
+			for (std::size_t i = 4; i < subopts.size(); ++i) {
+				optionsStream << ":" << subopts[i];
+			}
+			std::string options = optionsStream.str();
 			if (!mnt::addMountPtTail(nsjconf.get(), src, dst, /* fstype= */ fs_type,
 				/* options= */ options, /* flags= */ 0,
 				/* is_dir= */ mnt::NS_DIR_MAYBE, /* is_mandatory= */ true,
@@ -846,6 +858,9 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 		case 0x706:
 			nsjconf->iface_vs_mo = parseMACVlanMode(optarg);
 			break;
+		case 0x707:
+			nsjconf->disable_tsc = true;
+			break;
 		case 0x801:
 			nsjconf->cgroup_mem_max = (size_t)strtoull(optarg, NULL, 0);
 			break;
@@ -854,6 +869,12 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 			break;
 		case 0x803:
 			nsjconf->cgroup_mem_parent = optarg;
+			break;
+		case 0x804:
+			nsjconf->cgroup_mem_memsw_max = (size_t)strtoull(optarg, NULL, 0);
+			break;
+		case 0x805:
+			nsjconf->cgroup_mem_swap_max = (ssize_t)strtoll(optarg, NULL, 0);
 			break;
 		case 0x811:
 			nsjconf->cgroup_pids_max = (unsigned int)strtoul(optarg, NULL, 0);
@@ -917,6 +938,11 @@ std::unique_ptr<nsjconf_t> parseArgs(int argc, char* argv[]) {
 		return nullptr;
 	}
 	setupUsers(nsjconf.get());
+
+	if (nsjconf->cgroup_mem_memsw_max > (size_t)0 &&
+	    nsjconf->cgroup_mem_swap_max >= (ssize_t)0) {
+		LOG_F("cannot set both cgroup_mem_memsw_max and cgroup_mem_swap_max");
+	}
 
 	return nsjconf;
 }

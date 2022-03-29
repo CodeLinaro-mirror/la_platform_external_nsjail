@@ -67,7 +67,7 @@ static const std::string cloneFlagsToStr(uintptr_t flags) {
 	std::string res;
 
 	struct {
-		const uintptr_t flag;
+		const uint64_t flag;
 		const char* const name;
 	} static const cloneFlags[] = {
 		NS_VALSTR_STRUCT(CLONE_NEWTIME),
@@ -100,7 +100,7 @@ static const std::string cloneFlagsToStr(uintptr_t flags) {
 		NS_VALSTR_STRUCT(CLONE_IO),
 	};
 
-	uintptr_t knownFlagMask = 0;
+	uint64_t knownFlagMask = 0;
 	for (const auto& i : cloneFlags) {
 		if (flags & i.flag) {
 			if (!res.empty()) {
@@ -266,10 +266,11 @@ static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
 	const auto& p = nsjconf->pids.find(si->si_pid);
 	if (p == nsjconf->pids.end()) {
 		LOG_W(
-		    "pid=%d SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d. (If "
-		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
-		    "'journalctl -ek' for possible auditd report with more data)",
-		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo);
+		    "pid=%d SiStatus:%d SiUid:%d SiUtime:%ld SiStime:%ld (If "
+		    "SiStatus==31 (SIGSYS), then see 'dmesg' or 'journalctl -ek' for possible "
+		    "auditd report with more data)",
+		    (int)si->si_pid, si->si_status, si->si_uid, (long)si->si_utime,
+		    (long)si->si_stime);
 		LOG_E("Couldn't find pid element in the subproc list for pid=%d", (int)si->si_pid);
 		return;
 	}
@@ -278,10 +279,11 @@ static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
 	ssize_t rdsize = util::readFromFd(p->second.pid_syscall_fd, buf, sizeof(buf) - 1);
 	if (rdsize < 1) {
 		LOG_W(
-		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d. (If "
-		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
-		    "'journalctl -ek' for possible auditd report with more data)",
-		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo);
+		    "pid=%d SiStatus:%d SiUid:%d SiUtime:%ld SiStime:%ld (If "
+		    "SiStatus==31 (SIGSYS), then see 'dmesg' or 'journalctl -ek' for possible "
+		    "auditd report with more data)",
+		    (int)si->si_pid, si->si_status, si->si_uid, (long)si->si_utime,
+		    (long)si->si_stime);
 		return;
 	}
 	buf[rdsize - 1] = '\0';
@@ -292,23 +294,24 @@ static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
 	    &arg4, &arg5, &arg6, &sp, &pc);
 	if (ret == 9) {
 		LOG_W(
-		    "pid=%d, Syscall number: %td, Arguments: %#tx, %#tx, %#tx, %#tx, %#tx, %#tx, "
-		    "SP: %#tx, PC: %#tx, si_syscall: %d, si_errno: %#x",
-		    (int)si->si_pid, sc, arg1, arg2, arg3, arg4, arg5, arg6, sp, pc, si->si_syscall,
-		    si->si_errno);
+		    "pid=%d, Syscall number:%td, Arguments:%#tx, %#tx, %#tx, %#tx, %#tx, %#tx, "
+		    "SP:%#tx, PC:%#tx, si_status:%d",
+		    (int)si->si_pid, sc, arg1, arg2, arg3, arg4, arg5, arg6, sp, pc, si->si_status);
 	} else if (ret == 3) {
 		LOG_W(
-		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, SiSigno: %d, SP: %#tx, PC: "
-		    "%#tx (If SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' "
-		    "or 'journalctl -ek' for possible auditd report with more data)",
-		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, si->si_signo, arg1,
-		    arg2);
+		    "pid=%d SiStatus:%d SiUid:%d SiUtime:%ld SiStime:%ld SP:%#tx, PC:%#tx (If "
+		    "SiStatus==31 (SIGSYS), then see 'dmesg' or 'journalctl -ek' for possible "
+		    "auditd report with more data)",
+		    (int)si->si_pid, si->si_status, si->si_uid, (long)si->si_utime,
+		    (long)si->si_stime, arg1, arg2);
+		return;
 	} else {
 		LOG_W(
-		    "pid=%d, SiSyscall: %d, SiCode: %d, SiErrno: %d, Syscall string '%s'. (If "
-		    "SiSyscall==31, then it's most likely the SIGSYS value. See 'dmesg' or "
-		    "'journalctl -ek' for possible auditd report with more data)",
-		    (int)si->si_pid, si->si_syscall, si->si_code, si->si_errno, buf);
+		    "pid=%d SiStatus:%d SiUid:%d SiUtime:%ld SiStime:%ld (If "
+		    "SiStatus==31 (SIGSYS), then see 'dmesg' or 'journalctl -ek' for possible "
+		    "auditd report with more data)",
+		    (int)si->si_pid, si->si_status, si->si_uid, (long)si->si_utime,
+		    (long)si->si_stime);
 	}
 }
 
@@ -526,19 +529,9 @@ pid_t cloneProc(uintptr_t flags, int exit_signal) {
 	}
 
 #if defined(__NR_clone3)
-	struct clone_args ca = {
-	    .flags = (uint64_t)flags,
-	    .pidfd = 0,
-	    .child_tid = 0,
-	    .parent_tid = 0,
-	    .exit_signal = (uint64_t)exit_signal,
-	    .stack = 0,
-	    .stack_size = 0,
-	    .tls = 0,
-	    .set_tid = 0,
-	    .set_tid_size = 0,
-	    .cgroup = 0,
-	};
+	struct clone_args ca = {};
+	ca.flags = (uint64_t)flags;
+	ca.exit_signal = (uint64_t)exit_signal;
 
 	pid_t ret = util::syscall(__NR_clone3, (uintptr_t)&ca, sizeof(ca));
 	if (ret != -1 || errno != ENOSYS) {

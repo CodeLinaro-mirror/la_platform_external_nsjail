@@ -251,6 +251,8 @@ static bool configParseInternal(nsjconf_t* nsjconf, const nsjail::NsJailConfig& 
 	nsjconf->nice_level = njc.nice_level();
 
 	nsjconf->cgroup_mem_max = njc.cgroup_mem_max();
+	nsjconf->cgroup_mem_memsw_max = njc.cgroup_mem_memsw_max();
+	nsjconf->cgroup_mem_swap_max = njc.cgroup_mem_swap_max();
 	nsjconf->cgroup_mem_mount = njc.cgroup_mem_mount();
 	nsjconf->cgroup_mem_parent = njc.cgroup_mem_parent();
 	nsjconf->cgroup_pids_max = njc.cgroup_pids_max();
@@ -277,6 +279,8 @@ static bool configParseInternal(nsjconf_t* nsjconf, const nsjail::NsJailConfig& 
 	nsjconf->iface_vs_gw = njc.macvlan_vs_gw();
 	nsjconf->iface_vs_ma = njc.macvlan_vs_ma();
 	nsjconf->iface_vs_mo = njc.macvlan_vs_mo();
+
+	nsjconf->disable_tsc = njc.disable_tsc();
 
 	if (njc.has_exec_bin()) {
 		if (njc.exec_bin().has_path()) {
@@ -322,11 +326,11 @@ bool parseFile(nsjconf_t* nsjconf, const char* file) {
 		return false;
 	}
 	if (!configParseInternal(nsjconf, nsc)) {
-		LOG_W("Couldn't parse the ProtoBuf");
+		LOG_W("Couldn't parse the ProtoBuf from '%s'", file);
 		return false;
 	}
 
-	LOG_D("Parsed config:\n'%s'", nsc.DebugString().c_str());
+	LOG_D("Parsed config from '%s':\n'%s'", file, nsc.DebugString().c_str());
 	return true;
 }
 
