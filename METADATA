@@ -12,7 +12,7 @@ third_party {
     type: GIT
     value: "https://github.com/google/nsjail"
   }
-  version: "c7a313123b3dcb845ed3822b99ad9db69a6a82c8"
-  last_upgrade_date { year: 2019 month: 1 day: 10 }
+  version: "6483728e2490c1fc497a81bba5682515eb489cf8"
+  last_upgrade_date { year: 2022 month: 3 day: 29 }
   license_type: NOTICE
 }
